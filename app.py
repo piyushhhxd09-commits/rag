@@ -215,4 +215,4 @@ with gr.Blocks() as app:
     load_btn.click(process_pdf, inputs=file, outputs=status)
     search_btn.click(search, inputs=query, outputs=[output_text, output_img])
 
-app.launch(server_name="0.0.0.0", server_port=7860)
+app.launch(server_port=7860)
