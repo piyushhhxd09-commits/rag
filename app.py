@@ -1,14 +1,11 @@
 import gradio as gr
-import fitz  # PyMuPDF
+import fitz
 import io
 from PIL import Image
 import base64
 import os
 import tempfile
 
-# =========================
-# STORAGE
-# =========================
 TEXT_DB = []
 TABLE_DB = []
 IMAGE_DB = []
@@ -35,15 +32,38 @@ def expand_query(query):
 def overlap(a, b):
     return len(set(a.split()) & set(b.split()))
 
+# 🔥 NEW: importance scoring
+def importance_score(text, query):
+    score = overlap(query, text)
+
+    # longer meaningful sentences
+    if len(text.split()) > 8:
+        score += 2
+
+    # definition-like sentences
+    if "is defined as" in text or "refers to" in text:
+        score += 3
+
+    # contains numbers (often important)
+    if any(char.isdigit() for char in text):
+        score += 1
+
+    return score
+
 def encode_image(pix):
-    img = Image.open(io.BytesIO(pix.tobytes("jpeg")))
+    if pix.n >= 4:
+        pix = fitz.Pixmap(fitz.csRGB, pix)
+
+    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
     img = img.resize((500, int(500 * img.height / img.width)))
+
     buffer = io.BytesIO()
-    img.save(buffer, format="JPEG", quality=60)
+    img.save(buffer, format="JPEG", quality=80)
+
     return base64.b64encode(buffer.getvalue()).decode()
 
 # =========================
-# PDF PROCESSING (FINAL FIX)
+# PDF PROCESSING
 # =========================
 
 def process_pdf(file):
@@ -51,7 +71,6 @@ def process_pdf(file):
     TEXT_DB, TABLE_DB, IMAGE_DB = [], [], []
 
     try:
-        # 🔥 HANDLE BOTH CASES (LOCAL + RENDER)
         if isinstance(file, str):
             doc = fitz.open(file)
         else:
@@ -78,7 +97,6 @@ def process_pdf(file):
                     "page": page_num
                 })
 
-                # TABLE DETECTION
                 if (
                     "|" in text
                     or text.count("  ") > 3
@@ -89,13 +107,9 @@ def process_pdf(file):
                         "page": page_num
                     })
 
-            # IMAGE EXTRACTION
             for img in page.get_images(full=True):
                 xref = img[0]
                 pix = fitz.Pixmap(doc, xref)
-
-                if pix.n > 4:
-                    pix = fitz.Pixmap(fitz.csRGB, pix)
 
                 IMAGE_DB.append({
                     "image": encode_image(pix),
@@ -110,7 +124,7 @@ def process_pdf(file):
         return f"Error: {str(e)}"
 
 # =========================
-# SEARCH (UNCHANGED)
+# SEARCH (IMPROVED TEXT)
 # =========================
 
 def search(query):
@@ -125,7 +139,7 @@ def search(query):
     image_results = []
 
     for item in TEXT_DB:
-        score = overlap(query, item["text"])
+        score = importance_score(item["text"], query)
         if score > 0:
             text_results.append((score, item))
 
@@ -143,16 +157,25 @@ def search(query):
     table_results.sort(reverse=True, key=lambda x: x[0])
     image_results.sort(reverse=True, key=lambda x: x[0])
 
-    text_results = text_results[:5]
+    # 🔥 remove duplicates
+    seen = set()
+    final_text = []
+    for _, item in text_results:
+        if item["text"] not in seen:
+            final_text.append(item["text"])
+            seen.add(item["text"])
+        if len(final_text) >= 5:
+            break
+
     table_results = table_results[:3]
     image_results = image_results[:4]
 
     output = ""
 
-    if text_results:
-        output += "### Key Points\n"
-        for _, item in text_results:
-            output += f"- {item['text']}\n"
+    if final_text:
+        output += "### Key Explanation\n"
+        for t in final_text:
+            output += f"- {t}\n"
 
     if table_results:
         output += "\n### Tables\n"
@@ -186,7 +209,7 @@ with gr.Blocks() as app:
     search_btn.click(search, inputs=query, outputs=[output_text, output_images])
 
 # =========================
-# RENDER SAFE LAUNCH
+# LAUNCH
 # =========================
 
 app.launch(
