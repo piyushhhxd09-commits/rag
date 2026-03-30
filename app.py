@@ -16,8 +16,55 @@ IMG_DB = []
 text_index = None
 
 # =========================
-# IMPORTANCE SCORE
+# HELPERS
 # =========================
+
+def normalize(text):
+    return text.lower().strip()
+
+def expand_query(query):
+    words = query.split()
+    expanded = set(words)
+
+    for w in words:
+        expanded.add(w)
+        expanded.add(w + "s")
+        expanded.add(w.rstrip("s"))
+
+    return " ".join(expanded)
+
+# 🔥 Dynamic anchor extraction (NO HARDCODING)
+def get_anchor(query):
+    stopwords = {
+        "what", "is", "the", "of", "in", "and",
+        "system", "process", "method", "design",
+        "explain", "describe"
+    }
+
+    words = query.lower().split()
+
+    # choose most meaningful word
+    for w in words:
+        if w not in stopwords and len(w) > 3:
+            return w
+
+    return words[0]
+
+# 🔥 STRICT FILTER (topic lock)
+def strict_filter(query):
+    anchor = get_anchor(query)
+
+    filtered = [
+        t for t in TEXT_DB
+        if anchor in t["text"].lower()
+    ]
+
+    return filtered if filtered else TEXT_DB
+
+# =========================
+# IMPORTANCE SCORING
+# =========================
+
 def importance_score(text, query):
     score = 0
     text_l = text.lower()
@@ -27,40 +74,28 @@ def importance_score(text, query):
         if w in text_l:
             score += 3
 
-    if "defined" in text_l or "is" in text_l:
+    if "defined" in text_l or "refers" in text_l:
         score += 2
 
     if any(char.isdigit() for char in text_l):
         score += 1
 
-    if len(text.split()) > 12:
+    if len(text.split()) > 10:
         score += 2
 
     return score
 
 # =========================
-# QUERY FILTER
+# 🔥 DEEP SEARCH (FINAL)
 # =========================
-def filter_relevant(query):
-    keywords = query.lower().split()
 
-    filtered = [
-        t for t in TEXT_DB
-        if any(k in t["text"].lower() for k in keywords)
-    ]
-
-    return filtered if filtered else TEXT_DB
-
-# =========================
-# 🔥 DEEP SEARCH
-# =========================
 def deep_search(query):
     global text_index
 
     query_vec = model.encode([query])
-    D, I = text_index.search(np.array(query_vec), 25)  # 🔥 increased
+    D, I = text_index.search(np.array(query_vec), 25)
 
-    filtered = filter_relevant(query)
+    filtered = strict_filter(query)
 
     collected = []
 
@@ -68,23 +103,24 @@ def deep_search(query):
         if idx < len(TEXT_DB):
             text = TEXT_DB[idx]["text"]
 
-            # only keep filtered ones
             if text in [f["text"] for f in filtered]:
                 score = importance_score(text, query)
+
                 if score > 2:
                     collected.append((score, text))
 
-    # sort
     collected = sorted(collected, reverse=True)
 
     # remove duplicates
     seen = set()
     final = []
+
     for _, t in collected:
         if t not in seen:
             final.append(t)
             seen.add(t)
-        if len(final) >= 10:
+
+        if len(final) >= 8:
             break
 
     return final
@@ -92,12 +128,14 @@ def deep_search(query):
 # =========================
 # FORMAT OUTPUT
 # =========================
+
 def format_answer(texts):
     return "\n".join([f"- {t}" for t in texts])
 
 # =========================
-# PROCESS PDF
+# PDF PROCESSING
 # =========================
+
 def process_pdf(file):
     global TEXT_DB, IMG_DB, text_index
 
@@ -130,7 +168,6 @@ def process_pdf(file):
             except:
                 continue
 
-    # embeddings
     embeddings = model.encode([t["text"] for t in TEXT_DB])
     dim = embeddings.shape[1]
 
@@ -142,9 +179,12 @@ def process_pdf(file):
 # =========================
 # SEARCH
 # =========================
+
 def search(query):
     if not query.strip():
-        return "Enter query", []
+        return "Enter a query", []
+
+    query = expand_query(query)
 
     results = deep_search(query)
 
@@ -158,6 +198,7 @@ def search(query):
 # =========================
 # UI
 # =========================
+
 with gr.Blocks() as app:
     gr.Markdown("# 📄 PDF Assistant")
 
