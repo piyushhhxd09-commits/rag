@@ -3,6 +3,8 @@ import fitz  # PyMuPDF
 import io
 from PIL import Image
 import base64
+import tempfile
+import os
 
 # =========================
 # STORAGE
@@ -43,14 +45,19 @@ def encode_image(pix):
     return base64.b64encode(buffer.getvalue()).decode()
 
 # =========================
-# PDF PROCESSING
+# PDF PROCESSING (FIXED FOR RENDER)
 # =========================
 
 def process_pdf(file):
     global TEXT_DB, TABLE_DB, IMAGE_DB
     TEXT_DB, TABLE_DB, IMAGE_DB = [], [], []
 
-    doc = fitz.open(stream=file.read(), filetype="pdf")
+    # 🔥 FIX: Save temp file (Render-safe)
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(file.read())
+        tmp_path = tmp.name
+
+    doc = fitz.open(tmp_path)
 
     for page_num, page in enumerate(doc):
         blocks = page.get_text("blocks")
@@ -71,7 +78,7 @@ def process_pdf(file):
                 "page": page_num
             })
 
-            # TABLE DETECTION (IMPROVED)
+            # TABLE DETECTION (UNCHANGED)
             if (
                 "|" in text
                 or text.count("  ") > 3
@@ -82,7 +89,7 @@ def process_pdf(file):
                     "page": page_num
                 })
 
-        # IMAGE EXTRACTION
+        # IMAGE EXTRACTION (UNCHANGED)
         for img in page.get_images(full=True):
             xref = img[0]
             pix = fitz.Pixmap(doc, xref)
@@ -102,12 +109,12 @@ def process_pdf(file):
     return "PDF loaded successfully"
 
 # =========================
-# SEARCH (CORE LOGIC)
+# SEARCH (UNCHANGED)
 # =========================
 
 def search(query):
     if not query.strip():
-        return "Enter a query"
+        return "Enter a query", ""
 
     query = normalize(query)
     query = expand_query(query)
@@ -139,15 +146,12 @@ def search(query):
     table_results.sort(reverse=True, key=lambda x: x[0])
     image_results.sort(reverse=True, key=lambda x: x[0])
 
-    # TOP RESULTS (dynamic, no hardcoding fixed count)
+    # LIMIT RESULTS
     text_results = text_results[:5]
     table_results = table_results[:3]
     image_results = image_results[:4]
 
-    # =========================
-    # OUTPUT BUILD
-    # =========================
-
+    # OUTPUT
     output = ""
 
     if text_results:
@@ -170,31 +174,25 @@ def search(query):
 # UI
 # =========================
 
-with gr.Blocks(theme=gr.themes.Soft()) as app:
-
+with gr.Blocks() as app:
     gr.Markdown("# 📄 PDF Assistant")
 
-    with gr.Row():
-        with gr.Column():
-            file = gr.File(label="Upload PDF")
-            load_btn = gr.Button("Load PDF")
-            status = gr.Textbox(label="Status")
+    file = gr.File(label="Upload PDF")
+    load_btn = gr.Button("Load PDF")
+    status = gr.Textbox(label="Status")
 
-            query = gr.Textbox(label="Ask")
-            search_btn = gr.Button("Search")
+    query = gr.Textbox(label="Ask")
+    search_btn = gr.Button("Search")
 
-        with gr.Column():
-            output_text = gr.Markdown()
-            output_images = gr.HTML()
+    output_text = gr.Markdown()
+    output_images = gr.HTML()
 
     load_btn.click(process_pdf, inputs=file, outputs=status)
     search_btn.click(search, inputs=query, outputs=[output_text, output_images])
 
 # =========================
-# IMPORTANT FIX (HF ISSUE)
+# LAUNCH (RENDER SAFE)
 # =========================
-
-import os
 
 app.launch(
     server_name="0.0.0.0",
