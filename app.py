@@ -1,59 +1,68 @@
 import gradio as gr
-import fitz  # PyMuPDF
+import fitz
 import numpy as np
-import faiss
 import re
 import math
 from collections import Counter
 from sentence_transformers import SentenceTransformer
 from PIL import Image
-import os  # ✅ added (only for render)
+import io
+import os  # ✅ only added
 
 # =========================
-# MODELS
+# MODEL
 # =========================
 model = SentenceTransformer("all-MiniLM-L6-v2")
 
 # =========================
-# GLOBAL STORAGE
+# STORAGE
 # =========================
 text_chunks = []
 images = []
 tables = []
 
-text_index = None
-image_index = None
-table_index = None
+text_embeddings = None
+image_embeddings = None
+table_embeddings = None
 
 WORD_FREQ = None
 TOTAL_WORDS = 1
 
 # =========================
-# TEXT CLEAN
+# CLEAN
 # =========================
 def clean_text(text):
     return " ".join(text.split())
+
+# =========================
+# SAFE IMAGE CONVERT
+# =========================
+def pix_to_pil(pix):
+    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+    
+    max_size = 1200
+    if img.width > max_size or img.height > max_size:
+        img.thumbnail((max_size, max_size))
+    
+    return img
 
 # =========================
 # PROCESS PDF
 # =========================
 def process_pdf(file):
     global text_chunks, images, tables
-    global text_index, image_index, table_index
+    global text_embeddings, image_embeddings, table_embeddings
     global WORD_FREQ, TOTAL_WORDS
 
-    text_chunks = []
-    images = []
-    tables = []
+    text_chunks, images, tables = [], [], []
 
-    # ✅ file handling (your logic intact)
     if isinstance(file, str):
         doc = fitz.open(file)
     else:
         doc = fitz.open(stream=file.read(), filetype="pdf")
 
     # -------- TEXT --------
-    for page_num, page in enumerate(doc):
+    for page in doc:
         blocks = page.get_text("blocks")
         for b in blocks:
             txt = clean_text(b[4])
@@ -70,10 +79,10 @@ def process_pdf(file):
         total_words += len(words)
 
     WORD_FREQ = word_freq
-    TOTAL_WORDS = total_words if total_words > 0 else 1
+    TOTAL_WORDS = max(total_words, 1)
 
     # -------- IMAGES --------
-    for page_num, page in enumerate(doc):
+    for page in doc:
         for img in page.get_images(full=True):
             xref = img[0]
             pix = fitz.Pixmap(doc, xref)
@@ -81,74 +90,52 @@ def process_pdf(file):
             if pix.n >= 4:
                 pix = fitz.Pixmap(fitz.csRGB, pix)
 
-            img_data = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
-                pix.height, pix.width, pix.n
-            )
+            pil_img = pix_to_pil(pix)
 
-            rect = page.rect
-            blocks = page.get_text("blocks")
-
-            context = ""
-            for b in blocks:
-                if abs(b[1] - rect.y1) < 300:
-                    context += " " + b[4]
+            context = page.get_text().lower()
 
             images.append({
-                "image": img_data,
-                "context": context.lower()
+                "image": pil_img,
+                "context": context
             })
 
     # -------- TABLES --------
-    for page_num, page in enumerate(doc):
+    for page in doc:
         blocks = page.get_text("blocks")
-
         for b in blocks:
             txt = b[4].lower()
 
-            if len(txt) > 80 and (
-                "|" in txt or "table" in txt or "no." in txt
-            ):
+            if len(txt) > 80 and ("table" in txt or "|" in txt):
                 rect = fitz.Rect(b[:4])
                 pix = page.get_pixmap(clip=rect)
 
-                img_data = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
-                    pix.height, pix.width, pix.n
-                )
+                pil_img = pix_to_pil(pix)
 
                 tables.append({
-                    "image": img_data,
+                    "image": pil_img,
                     "context": txt
                 })
 
     # -------- EMBEDDINGS --------
     if text_chunks:
-        emb = model.encode(text_chunks)
-        text_index = faiss.IndexFlatL2(emb.shape[1])
-        text_index.add(np.array(emb))
+        text_embeddings = model.encode(text_chunks)
 
     if images:
-        emb = model.encode([i["context"] for i in images])
-        image_index = faiss.IndexFlatL2(emb.shape[1])
-        image_index.add(np.array(emb))
+        image_embeddings = model.encode([i["context"] for i in images])
 
     if tables:
-        emb = model.encode([t["context"] for t in tables])
-        table_index = faiss.IndexFlatL2(emb.shape[1])
-        table_index.add(np.array(emb))
+        table_embeddings = model.encode([t["context"] for t in tables])
 
     return "PDF loaded successfully ✅"
 
 # =========================
-# IMPORTANCE
+# SCORING
 # =========================
 def word_importance(word):
     freq = WORD_FREQ.get(word, 1)
     return math.log((TOTAL_WORDS + 1) / freq)
 
-# =========================
-# MATCHING
-# =========================
-def strong_match(query, text):
+def smart_score(query, text):
     score = 0
     q = query.lower()
 
@@ -157,72 +144,63 @@ def strong_match(query, text):
 
     for w in q.split():
         if w in text:
-            score += 1
+            score += word_importance(w)
 
     return score
-
-def smart_score(query, text):
-    base = strong_match(query, text)
-    text_lower = text.lower()
-
-    words = query.lower().split()
-    dynamic = 0
-
-    for w in words:
-        if w in text_lower:
-            dynamic += word_importance(w)
-
-    return base + dynamic
 
 # =========================
 # SEARCH
 # =========================
 def search(query):
-    results_text = []
-    results_images = []
-    results_tables = []
+    q_emb = model.encode([query])[0]
 
-    # TEXT
-    if text_index:
-        q_emb = model.encode([query])
-        _, idx = text_index.search(np.array(q_emb), 5)
+    output = ""
 
-        for i in idx[0]:
+    # -------- TEXT --------
+    if text_embeddings is not None:
+        scores = np.dot(text_embeddings, q_emb)
+        idx = np.argsort(scores)[::-1][:5]
+
+        for i in idx:
             txt = text_chunks[i]
             if smart_score(query, txt) > 2:
-                results_text.append(txt)
+                output += f"• {txt}\n\n"
 
-    # IMAGES
-    if image_index:
-        q_emb = model.encode([query])
-        _, idx = image_index.search(np.array(q_emb), 6)
+    # -------- TABLES --------
+    table_imgs = []
+    if table_embeddings is not None:
+        scores = np.dot(table_embeddings, q_emb)
+        idx = np.argsort(scores)[::-1][:5]
 
-        scored = []
-        for i in idx[0]:
-            item = images[i]
-            score = smart_score(query, item["context"])
-            if score > 2:
-                scored.append((score, item))
-
-        scored.sort(reverse=True, key=lambda x: x[0])
-        results_images = [x[1]["image"] for x in scored[:3]]
-
-    # TABLES
-    if table_index:
-        q_emb = model.encode([query])
-        _, idx = table_index.search(np.array(q_emb), 6)
-
-        scored = []
-        for i in idx[0]:
+        for i in idx:
             item = tables[i]
-            score = smart_score(query, item["context"])
-            if score > 2:
-                scored.append((score, item))
+            if smart_score(query, item["context"]) > 2:
+                table_imgs.append(item["image"])
+
+    # -------- IMAGES --------
+    image_imgs = []
+    if image_embeddings is not None:
+        scores = np.dot(image_embeddings, q_emb)
+        idx = np.argsort(scores)[::-1][:6]
+
+        scored = []
+        for i in idx:
+            item = images[i]
+            s = smart_score(query, item["context"])
+            if s > 2:
+                scored.append((s, item))
 
         scored.sort(reverse=True, key=lambda x: x[0])
-        results_tables = [x[1]["image"] for x in scored[:3]]
 
-    return results_text, results_images, results_tables
+        if scored:
+            best = scored[0][0]
+            scored = [x for x in scored if x[0] >= best * 0.75]
+
+        image_imgs = [x[1]["image"] for x in scored]
+
+    all_images = table_imgs + image_imgs
+
+    return output, all_images
 
 # =========================
 # UI
@@ -230,28 +208,18 @@ def search(query):
 with gr.Blocks() as demo:
     gr.Markdown("# 📄 PDF Assistant")
 
-    with gr.Row():
-        with gr.Column(scale=1):
-            file = gr.File(label="Upload PDF")
-            load_btn = gr.Button("Load PDF")
-            status = gr.Textbox(label="Status")
+    file = gr.File()
+    load_btn = gr.Button("Load PDF")
+    status = gr.Textbox()
 
-            query = gr.Textbox(label="Ask")
-            search_btn = gr.Button("Search")
+    query = gr.Textbox()
+    search_btn = gr.Button("Search")
 
-        with gr.Column(scale=2):
-            text_output = gr.Textbox(label="Key Points", lines=15)
-            img_output = gr.Gallery(label="Images")
-            table_output = gr.Gallery(label="Tables")
+    text_output = gr.Textbox(label="Answer", lines=15)
+    gallery = gr.Gallery(label="Results")
 
     load_btn.click(process_pdf, inputs=file, outputs=status)
-
-    def run_search(q):
-        txt, imgs, tbls = search(q)
-        return "\n\n".join(txt), imgs, tbls
-
-    search_btn.click(run_search, inputs=query,
-                     outputs=[text_output, img_output, table_output])
+    search_btn.click(search, inputs=query, outputs=[text_output, gallery])
 
 # =========================
 # 🚀 RENDER FIX ONLY
