@@ -1,19 +1,16 @@
 import gradio as gr
 import fitz
-import numpy as np
-import faiss
-from sentence_transformers import SentenceTransformer
-from PIL import Image
 import io
+from PIL import Image
+import base64
+import os
 
 # =========================
-# MODEL
+# STORAGE
 # =========================
-model = SentenceTransformer("all-MiniLM-L6-v2")
-
 TEXT_DB = []
-IMG_DB = []
-text_index = None
+TABLE_DB = []
+IMAGE_DB = []
 
 # =========================
 # HELPERS
@@ -30,149 +27,108 @@ def expand_query(query):
         expanded.add(w)
         expanded.add(w + "s")
         expanded.add(w.rstrip("s"))
+        expanded.add(w[:4])
 
     return " ".join(expanded)
 
-# 🔥 Dynamic anchor extraction (NO HARDCODING)
-def get_anchor(query):
-    stopwords = {
-        "what", "is", "the", "of", "in", "and",
-        "system", "process", "method", "design",
-        "explain", "describe"
-    }
+def strong_match(query, text):
+    q_words = set(query.split())
+    t_words = set(text.split())
 
-    words = query.lower().split()
+    overlap = len(q_words & t_words)
 
-    # choose most meaningful word
-    for w in words:
-        if w not in stopwords and len(w) > 3:
-            return w
+    soft = 0
+    for q in q_words:
+        for t in t_words:
+            if q in t or t in q:
+                soft += 1
 
-    return words[0]
+    return overlap + (soft * 0.3)
 
-# 🔥 STRICT FILTER (topic lock)
-def strict_filter(query):
-    anchor = get_anchor(query)
+def encode_image(pix):
+    if pix.colorspace is None or pix.colorspace.n != 3:
+        pix = fitz.Pixmap(fitz.csRGB, pix)
 
-    filtered = [
-        t for t in TEXT_DB
-        if anchor in t["text"].lower()
-    ]
+    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+    img = img.resize((500, int(500 * img.height / img.width)))
 
-    return filtered if filtered else TEXT_DB
+    buffer = io.BytesIO()
+    img.save(buffer, format="JPEG", quality=85)
 
-# =========================
-# IMPORTANCE SCORING
-# =========================
-
-def importance_score(text, query):
-    score = 0
-    text_l = text.lower()
-    query_l = query.lower()
-
-    for w in query_l.split():
-        if w in text_l:
-            score += 3
-
-    if "defined" in text_l or "refers" in text_l:
-        score += 2
-
-    if any(char.isdigit() for char in text_l):
-        score += 1
-
-    if len(text.split()) > 10:
-        score += 2
-
-    return score
-
-# =========================
-# 🔥 DEEP SEARCH (FINAL)
-# =========================
-
-def deep_search(query):
-    global text_index
-
-    query_vec = model.encode([query])
-    D, I = text_index.search(np.array(query_vec), 25)
-
-    filtered = strict_filter(query)
-
-    collected = []
-
-    for idx in I[0]:
-        if idx < len(TEXT_DB):
-            text = TEXT_DB[idx]["text"]
-
-            if text in [f["text"] for f in filtered]:
-                score = importance_score(text, query)
-
-                if score > 2:
-                    collected.append((score, text))
-
-    collected = sorted(collected, reverse=True)
-
-    # remove duplicates
-    seen = set()
-    final = []
-
-    for _, t in collected:
-        if t not in seen:
-            final.append(t)
-            seen.add(t)
-
-        if len(final) >= 8:
-            break
-
-    return final
-
-# =========================
-# FORMAT OUTPUT
-# =========================
-
-def format_answer(texts):
-    return "\n".join([f"- {t}" for t in texts])
+    return base64.b64encode(buffer.getvalue()).decode()
 
 # =========================
 # PDF PROCESSING
 # =========================
 
 def process_pdf(file):
-    global TEXT_DB, IMG_DB, text_index
+    global TEXT_DB, TABLE_DB, IMAGE_DB
+    TEXT_DB, TABLE_DB, IMAGE_DB = [], [], []
 
-    TEXT_DB = []
-    IMG_DB = []
-
-    doc = fitz.open(file.name)
+    try:
+        if hasattr(file, "name"):
+            doc = fitz.open(file.name)
+        elif isinstance(file, str):
+            doc = fitz.open(file)
+        else:
+            doc = fitz.open(stream=file.read(), filetype="pdf")
+    except Exception as e:
+        return f"Error: {str(e)}"
 
     for page_num, page in enumerate(doc):
 
         blocks = page.get_text("blocks")
+        page_text = ""
 
+        # -------- TEXT + TABLE CAPTION --------
         for b in blocks:
-            text = b[4].strip()
-
-            if len(text) > 40:
-                TEXT_DB.append({
-                    "text": text,
-                    "page": page_num
-                })
-
-        for img in page.get_images(full=True):
-            xref = img[0]
-            base = doc.extract_image(xref)
-
-            try:
-                img_bytes = base["image"]
-                image = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-                IMG_DB.append(image)
-            except:
+            x0, y0, x1, y1, text, *_ = b
+            text = text.strip()
+            if not text:
                 continue
 
-    embeddings = model.encode([t["text"] for t in TEXT_DB])
-    dim = embeddings.shape[1]
+            norm = normalize(text)
+            page_text += " " + norm
 
-    text_index = faiss.IndexFlatL2(dim)
-    text_index.add(np.array(embeddings))
+            TEXT_DB.append({
+                "text": norm,
+                "page": page_num
+            })
+
+            if "table" in norm:
+                TABLE_DB.append({
+                    "text": norm,
+                    "page": page_num,
+                    "bbox": (x0, y0, x1, y1),
+                    "type": "caption"
+                })
+
+        # -------- IMAGE --------
+        for img in page.get_images(full=True):
+            xref = img[0]
+            pix = fitz.Pixmap(doc, xref)
+
+            IMAGE_DB.append({
+                "image": encode_image(pix),
+                "page": page_num,
+                "context": page_text[:500]
+            })
+
+        # -------- TABLE REGION --------
+        drawings = page.get_drawings()
+
+        for d in drawings:
+            rect = fitz.Rect(d["rect"])
+
+            if rect.width > 200 and rect.height > 100:
+                pix = page.get_pixmap(clip=rect)
+
+                TABLE_DB.append({
+                    "image": encode_image(pix),
+                    "page": page_num,
+                    "type": "table_image",
+                    "context": page_text[:500]
+                })
 
     return "PDF loaded successfully"
 
@@ -182,37 +138,98 @@ def process_pdf(file):
 
 def search(query):
     if not query.strip():
-        return "Enter a query", []
+        return "Enter query", ""
 
-    query = expand_query(query)
+    query = normalize(query)
+    expanded = expand_query(query)
 
-    results = deep_search(query)
+    base_threshold = max(2, len(query.split()) * 0.7)
 
-    if not results:
-        return "No relevant information found", []
+    text_results = []
+    table_results = []
+    image_results = []
 
-    answer = format_answer(results)
+    # -------- TEXT --------
+    for item in TEXT_DB:
+        score = strong_match(expanded, item["text"])
+        if score >= base_threshold:
+            text_results.append((score, item))
 
-    return answer, IMG_DB[:3]
+    # -------- TABLE --------
+    for item in TABLE_DB:
+        if item.get("type") == "caption":
+            score = strong_match(expanded, item["text"])
+        else:
+            score = strong_match(expanded, item["context"])
+
+        if score >= 1.5:
+            table_results.append((score, item))
+
+    # -------- IMAGE --------
+    for item in IMAGE_DB:
+        score = strong_match(expanded, item["context"])
+
+        if score >= base_threshold + 1:
+            image_results.append((score, item))
+
+    text_results.sort(reverse=True, key=lambda x: x[0])
+    table_results.sort(reverse=True, key=lambda x: x[0])
+    image_results.sort(reverse=True, key=lambda x: x[0])
+
+    # -------- OUTPUT --------
+    output = ""
+
+    if text_results:
+        output += "### Key Points\n"
+        for _, item in text_results[:3]:
+            output += f"- {item['text']}\n"
+
+    if table_results:
+        output += "\n### Tables\n"
+
+        for _, item in table_results:
+            if item.get("type") == "table_image":
+                output += f"<img src='data:image/jpeg;base64,{item['image']}' width='500'><br><br>"
+            else:
+                output += f"{item['text']}\n\n"
+
+    images_html = ""
+    for _, item in image_results:
+        images_html += f"<img src='data:image/jpeg;base64,{item['image']}' width='500'><br><br>"
+
+    return output, images_html
 
 # =========================
 # UI
 # =========================
 
-with gr.Blocks() as app:
+with gr.Blocks(theme=gr.themes.Soft()) as app:
+
     gr.Markdown("# 📄 PDF Assistant")
 
-    file = gr.File(label="Upload PDF")
-    load_btn = gr.Button("Load PDF")
-    status = gr.Textbox(label="Status")
+    with gr.Row():
+        with gr.Column():
+            file = gr.File(label="Upload PDF")
+            load_btn = gr.Button("Load PDF")
+            status = gr.Textbox(label="Status")
 
-    query = gr.Textbox(label="Ask")
-    search_btn = gr.Button("Search")
+            query = gr.Textbox(label="Ask")
+            search_btn = gr.Button("Search")
 
-    output_text = gr.Textbox(label="Answer")
-    output_img = gr.Gallery(label="Images")
+        with gr.Column():
+            output_text = gr.Markdown()
+            output_images = gr.HTML()
 
     load_btn.click(process_pdf, inputs=file, outputs=status)
-    search_btn.click(search, inputs=query, outputs=[output_text, output_img])
+    search_btn.click(search, inputs=query, outputs=[output_text, output_images])
 
-app.launch(server_port=7860)
+# =========================
+# 🚀 RENDER FIX ONLY
+# =========================
+
+port = int(os.environ.get("PORT", 10000))
+
+app.launch(
+    server_name="0.0.0.0",
+    server_port=port
+)
