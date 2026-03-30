@@ -3,8 +3,8 @@ import fitz  # PyMuPDF
 import io
 from PIL import Image
 import base64
-import tempfile
 import os
+import tempfile
 
 # =========================
 # STORAGE
@@ -33,9 +33,7 @@ def expand_query(query):
     return " ".join(expanded)
 
 def overlap(a, b):
-    a_words = set(a.split())
-    b_words = set(b.split())
-    return len(a_words & b_words)
+    return len(set(a.split()) & set(b.split()))
 
 def encode_image(pix):
     img = Image.open(io.BytesIO(pix.tobytes("jpeg")))
@@ -45,68 +43,71 @@ def encode_image(pix):
     return base64.b64encode(buffer.getvalue()).decode()
 
 # =========================
-# PDF PROCESSING (FIXED FOR RENDER)
+# PDF PROCESSING (FINAL FIX)
 # =========================
 
 def process_pdf(file):
     global TEXT_DB, TABLE_DB, IMAGE_DB
     TEXT_DB, TABLE_DB, IMAGE_DB = [], [], []
 
-    # 🔥 FIX: Save temp file (Render-safe)
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-        tmp.write(file.read())
-        tmp_path = tmp.name
+    try:
+        # 🔥 HANDLE BOTH CASES (LOCAL + RENDER)
+        if isinstance(file, str):
+            doc = fitz.open(file)
+        else:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                tmp.write(file.read())
+                tmp_path = tmp.name
+            doc = fitz.open(tmp_path)
 
-    doc = fitz.open(tmp_path)
+        for page_num, page in enumerate(doc):
+            blocks = page.get_text("blocks")
 
-    for page_num, page in enumerate(doc):
-        blocks = page.get_text("blocks")
+            page_text = ""
 
-        page_text = ""
+            for b in blocks:
+                text = b[4].strip()
+                if not text:
+                    continue
 
-        for b in blocks:
-            text = b[4].strip()
-            if not text:
-                continue
+                norm = normalize(text)
+                page_text += " " + norm
 
-            norm = normalize(text)
-            page_text += " " + norm
-
-            # TEXT
-            TEXT_DB.append({
-                "text": norm,
-                "page": page_num
-            })
-
-            # TABLE DETECTION (UNCHANGED)
-            if (
-                "|" in text
-                or text.count("  ") > 3
-                or (len(text.split()) > 15 and text.count(" ") / len(text.split()) > 1.5)
-            ):
-                TABLE_DB.append({
+                TEXT_DB.append({
                     "text": norm,
                     "page": page_num
                 })
 
-        # IMAGE EXTRACTION (UNCHANGED)
-        for img in page.get_images(full=True):
-            xref = img[0]
-            pix = fitz.Pixmap(doc, xref)
+                # TABLE DETECTION
+                if (
+                    "|" in text
+                    or text.count("  ") > 3
+                    or (len(text.split()) > 15 and text.count(" ") / len(text.split()) > 1.5)
+                ):
+                    TABLE_DB.append({
+                        "text": norm,
+                        "page": page_num
+                    })
 
-            if pix.n > 4:
-                pix = fitz.Pixmap(fitz.csRGB, pix)
+            # IMAGE EXTRACTION
+            for img in page.get_images(full=True):
+                xref = img[0]
+                pix = fitz.Pixmap(doc, xref)
 
-            img_base64 = encode_image(pix)
+                if pix.n > 4:
+                    pix = fitz.Pixmap(fitz.csRGB, pix)
 
-            IMAGE_DB.append({
-                "image": img_base64,
-                "page": page_num,
-                "caption": page_text[:500],
-                "keywords": " ".join(page_text.split()[:20])
-            })
+                IMAGE_DB.append({
+                    "image": encode_image(pix),
+                    "page": page_num,
+                    "caption": page_text[:500],
+                    "keywords": " ".join(page_text.split()[:20])
+                })
 
-    return "PDF loaded successfully"
+        return "PDF loaded successfully"
+
+    except Exception as e:
+        return f"Error: {str(e)}"
 
 # =========================
 # SEARCH (UNCHANGED)
@@ -123,35 +124,29 @@ def search(query):
     table_results = []
     image_results = []
 
-    # TEXT SEARCH
     for item in TEXT_DB:
         score = overlap(query, item["text"])
         if score > 0:
             text_results.append((score, item))
 
-    # TABLE SEARCH
     for item in TABLE_DB:
         score = overlap(query, item["text"])
         if score > 0:
             table_results.append((score, item))
 
-    # IMAGE SEARCH
     for item in IMAGE_DB:
         score = overlap(query, item["caption"] + " " + item["keywords"])
         if score > 0:
             image_results.append((score, item))
 
-    # SORT
     text_results.sort(reverse=True, key=lambda x: x[0])
     table_results.sort(reverse=True, key=lambda x: x[0])
     image_results.sort(reverse=True, key=lambda x: x[0])
 
-    # LIMIT RESULTS
     text_results = text_results[:5]
     table_results = table_results[:3]
     image_results = image_results[:4]
 
-    # OUTPUT
     output = ""
 
     if text_results:
@@ -191,7 +186,7 @@ with gr.Blocks() as app:
     search_btn.click(search, inputs=query, outputs=[output_text, output_images])
 
 # =========================
-# LAUNCH (RENDER SAFE)
+# RENDER SAFE LAUNCH
 # =========================
 
 app.launch(
